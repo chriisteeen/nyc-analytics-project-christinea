@@ -1,0 +1,242 @@
+---
+title: "Exoplanet Observability: Finding Clean, Nearby Targets"
+author: "John Frasier"
+format: 
+  html: 
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Specific Question
+
+Which candidate exoplanets present the greatest observational feasibility for atmospheric characterization based on distance, host-star brightness, and transit depth, and how does Gaia DR3 astrometric screening filter out binary star contamination?
+
+## Summary of Approach
+
+Even if an exoplanet has Earth-like physical proportions and a temperate climate, it has limited scientific value if current telescopes cannot detect or characterize its atmosphere. This analysis reviews the known exoplanet catalog for practical observability using three operational criteria:
+
+- **Proximity:** Restricting candidates to systems within 100 parsecs ( d <= 100 pc).
+- **Transit Detectability:** Requiring a confirmed, non-zero transit depth (pl_trandep > 0) for transmission spectroscopy.
+- **Host-Star Stability:** Cross-referencing host stars with the European Space Agency (ESA) Gaia DR3 catalog to identify clean single stars (RUWE <= 1.4) and flag binary systems that distort measurements.
+
+## Data Quality and Setup
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(ggplot2)
+library(httr)
+
+# Step 1: Ingest NASA table and check completeness
+target_paths <- c(
+  "data/processed/nasa_clean.csv",
+  "../../data/processed/nasa_clean.csv",
+  "data/raw/nasa_pscomppars_2026-09-19.csv",
+  "../../data/raw/nasa_pscomppars_2026-09-19.csv",
+  "nasa_clean.csv",
+  "../../nasa_clean.csv"
+)
+
+data_path <- target_paths[file.exists(target_paths)][1]
+if (is.na(data_path)) {
+  stop("There was a problem loading the NASA dataset.")
+}
+
+df <- read.csv(data_path, stringsAsFactors = FALSE)
+total_planets <- nrow(df)
+
+# Evaluate missingness for key observability variables
+obs_cols <- c("sy_dist", "pl_trandep")
+missing_obs_pct <- (colSums(is.na(df[obs_cols])) / total_planets) * 100
+round(missing_obs_pct, 2)
+
+# Calculate percentage of planets with valid Gaia IDs
+missing_gaia <- sum(is.na(df$gaia_dr3_id) | df$gaia_dr3_id == "")
+pct_has_gaia <- ((total_planets - missing_gaia) / total_planets) * 100
+cat("Planets with Gaia ID:", round(pct_has_gaia, 2), "%\n")
+```
+
+System distance is missing in only 0.44% of records, demonstrating strong spatial completeness. Transit depth is missing in 28.98% of rows. This missing data is expected, as non-transiting detection methods like radial velocity do not produce photometric transit dips. Additionally, 93.86% (n = 5,975) of confirmed hosts have valid Gaia identifiers, ensuring astrometric cross-matching does not induce severe sample attrition.
+
+## Candidate Selection and Host Star Deduplication
+
+Because multi-planet systems (like TRAPPIST-1) have multiple planets around a single star, counting rows directly would impact the statistics. To address this, I filtered for nearby transiting worlds and then counted unique host stars.
+
+```{r}
+# Step 2: Remove string prefix so only the numeric source ID remains
+df$gaia_source_id <- gsub("^Gaia DR3 ", "", trimws(df$gaia_dr3_id))
+
+# Filter for transiting planets within 100 parsecs
+candidate_planets <- df %>%
+  filter(!is.na(sy_dist) & sy_dist <= 100 & 
+           !is.na(pl_trandep) & pl_trandep > 0 & 
+           !is.na(gaia_source_id) & gaia_source_id != "")
+
+# Week 4 feedback: Count only distinct stars so multi-planet systems don't bias stats
+unique_hosts <- candidate_planets %>%
+  distinct(hostname, .keep_all = TRUE)
+
+cat("Candidate Planets (<= 100 pc):", nrow(candidate_planets), "\n")
+cat("Unique Candidate Host Stars :", nrow(unique_hosts), "\n")
+```
+
+Filtering retains 528 candidate transiting planets within 100 parsecs. Deduplicating by host star reduces the sample to 388 unique stars, eliminating 140 redundant host entries.
+
+## Programmatic Gaia DR3 Astrometric Query
+
+I queried the ESA Gaia DR3 database to retrieve optical brightness (phot_g_mean_mag) and stellar wobble metrics (RUWE) for the 388 unique host stars.
+```{r}
+# Step 3: Check local cache or query Gaia TAP API
+gaia_candidates <- c(
+  "data/raw/gaia_nearby_hosts.csv",
+  "../../data/raw/gaia_nearby_hosts.csv",
+  "gaia_nearby_hosts.csv"
+)
+
+gaia_file <- gaia_candidates[file.exists(gaia_candidates)][1]
+if (is.na(gaia_file)) {
+  gaia_file <- if (dir.exists("data/raw")) "data/raw/gaia_nearby_hosts.csv" else if (dir.exists("../../data/raw")) "../../data/raw/gaia_nearby_hosts.csv" else "gaia_nearby_hosts.csv"
+}
+
+if (!file.exists(gaia_file)) {
+  clean_ids <- unique_hosts$gaia_source_id[grepl("^[0-9]+$", unique_hosts$gaia_source_id)]
+  id_list <- paste0("'", clean_ids, "'", collapse = ",")
+  
+  query_text <- paste0(
+    "SELECT source_id, parallax, phot_g_mean_mag, ruwe ",
+    "FROM gaiadr3.gaia_source WHERE source_id IN (", id_list, ")"
+  )
+  
+  res <- POST(
+    url = "https://gea.esac.esa.int/tap-server/tap/sync",
+    body = list(REQUEST = "doQuery", LANG = "ADQL", FORMAT = "csv", QUERY = query_text),
+    encode = "form",
+    timeout(180)
+  )
+  
+  stopifnot("Gaia TAP API query failed" = status_code(res) == 200)
+  
+  gaia_data <- read.csv(text = content(res, as = "text"), colClasses = c("source_id" = "character"))
+  write.csv(gaia_data, gaia_file, row.names = FALSE)
+} else {
+  gaia_data <- read.csv(gaia_file, colClasses = c("source_id" = "character"))
+}
+
+# Step 4: Merge Gaia data and classify by RUWE <= 1.4
+hosts_clean <- unique_hosts %>%
+  select(hostname, gaia_source_id, sy_dist, pl_trandep) %>%
+  left_join(gaia_data, by = c("gaia_source_id" = "source_id")) %>%
+  mutate(
+    star_type = ifelse(ruwe <= 1.4, "Single Star (Clean)", "Disturbed / Binary Star")
+  )
+
+cat("Astrometric Star Breakdown:\n")
+table(hosts_clean$star_type)
+```
+
+Out of 388 unique host stars, 370 (95.36%) are confirmed clean, single stars. Eighteen stars (4.64%) display excessive wobble (RUWE > 1.4), indicating unresolved binary companion systems or astrometric disturbance.
+
+## Observational Feasibility Visualizations
+
+I plotted host distance against optical brightness (phot_g_mean_mag). The y-axis is inverted following astronomical convention so brighter stars appear higher on the plot. The high-priority triage window (d <= 35 pc, G <= 12 mag) isolates the immediate solar neighborhood where spectroscopic signal-to-noise is maximized for space platforms (such as JWST), while maintaining a brightness threshold suitable for high-precision ground-based follow-up.
+
+```{r}
+# Step 5: Filter complete cases and generate feasibility plot
+plot_data <- hosts_clean %>% filter(!is.na(phot_g_mean_mag) & !is.na(star_type))
+
+fig3 <- ggplot(plot_data, aes(x = sy_dist, y = phot_g_mean_mag, color = star_type)) +
+  # Week 5 feedback: Highlight the high-priority triage window directly on the plot
+  annotate("rect", xmin = 0, xmax = 35, ymin = 12, ymax = 4,
+           fill = "forestgreen", alpha = 0.15, linetype = "dashed", color = "forestgreen") +
+  annotate("text", x = 18, y = 5, label = "High-Priority Triage Window\n(d <= 35 pc, G <= 12 mag)",
+           fontface = "bold", size = 3.5, color = "darkgreen") +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_y_reverse() +
+  scale_color_manual(values = c("Single Star (Clean)" = "forestgreen", 
+                                "Disturbed / Binary Star" = "firebrick")) +
+  labs(
+    title = "Observational Feasibility: Host Distance vs. Optical Brightness",
+    subtitle = "Unique transiting host stars (d <= 100 pc) cross-matched with Gaia DR3",
+    x = "Distance from Earth (Parsecs)",
+    y = "Gaia G-band Magnitude (Brighter Stars Upward)",
+    color = "Host Stability"
+  ) +
+  theme_minimal()
+
+print(fig3)
+```
+
+## Planetary Priority Tiers
+
+Joining host stability back to the 528 candidate planets categorizes them into three tiers:
+
+```{r}
+# Step 6: Categorize planets into three operational priority tiers
+planets_tiered <- candidate_planets %>%
+  left_join(select(hosts_clean, hostname, phot_g_mean_mag, ruwe, star_type), by = "hostname") %>%
+  mutate(
+    priority_tier = case_when(
+      ruwe > 1.4 ~ "Disqualified (Binary Noise)",
+      sy_dist <= 35 & phot_g_mean_mag <= 12.0 ~ "Tier 1: Prime Target (Nearby & Bright)",
+      TRUE ~ "Tier 2: Secondary Target (Fainter / Farther)"
+    )
+  )
+
+cat("Planets per Priority Tier:\n")
+table(planets_tiered$priority_tier)
+```
+
+The resulting distribution shows:
+
+- **Tier 1 (Best Targets):** 88 planets (16.67%)
+- **Tier 2 (Secondary Targets):** 410 planets (77.65%)
+- **Disqualified Systems:** 30 planets (5.68%)
+
+### Top Candidates (Tier 1)
+
+Within Tier 1, planets are ranked by transit depth (pl_trandep) in descending order, as deeper transits yield stronger transmission spectroscopy signals. To highlight distinct stellar systems, the table displays the highest-ranked planet per unique host star. This ranking deliberately does not filter for Earth-like properties; those criteria are applied when these results are combined with the team’s ESI analysis.
+
+```{r}
+tier1_distinct_hosts <- planets_tiered %>%
+  filter(priority_tier == "Tier 1: Prime Target (Nearby & Bright)") %>%
+  distinct(hostname, .keep_all = TRUE) %>%
+  select(pl_name, hostname, sy_dist, phot_g_mean_mag, ruwe, pl_trandep) %>%
+  arrange(desc(pl_trandep))
+
+knitr::kable(
+  head(tier1_distinct_hosts, 5),
+  col.names = c("Planet", "Host Star", "Distance (pc)", "Gaia G (mag)", "RUWE", "Transit Depth (%)"),
+  digits = 3,
+  row.names = FALSE
+)
+```
+
+## Statistical Analysis: Bootstrap Confidence Interval
+
+Because we cannot assume a standard distribution for the host stars, I used a 2,000-resample non-parametric bootstrap (seed 2026) to compute the sampling error and empirical confidence bounds.
+
+```{r}
+# Step 7: 2,000 bootstrap resamples for 95% confidence interval
+set.seed(2026)
+boot_binary <- replicate(2000, {
+  sample_ruwe <- sample(hosts_clean$ruwe[!is.na(hosts_clean$ruwe)], replace = TRUE)
+  mean(sample_ruwe > 1.4) * 100
+})
+
+ci_95 <- quantile(boot_binary, probs = c(0.025, 0.975))
+
+cat("Observed Binary Rate:", round(mean(hosts_clean$ruwe > 1.4, na.rm = TRUE) * 100, 2), "%\n")
+cat("95% Bootstrap CI    : [", round(ci_95[1], 2), "%,", round(ci_95[2], 2), "% ]\n")
+```
+
+The bootstrap simulation yields an empirical 95% confidence interval of [2.58%, 6.70%]. Treating these 388 stars as representative of the broader local transiting population indicates that approximately 1 in 20 nearby host candidates show signs of possible binarity.
+
+## Limitations and Conclusion
+
+- **Transit Bias:** Transit surveys naturally detect close-in planets with deep transit signals. Temperate worlds at larger orbital distances have lower geometric transit probabilities.
+- **RUWE Limitations:** While RUWE > 1.4 indicates stellar wobble, natural stellar activity, flare variability, or proper motion fitting errors can elevate RUWE without a bound companion.
+- **Wavelength Regimes:** Gaia measures visible optical flux (G-band), whereas cool M-dwarf host stars emit the bulk of their energy in the near-infrared.
+
+In conclusion, filtering for proximity and transit depth isolates 528 candidate planets across 388 unique host stars. Gaia astrometric screening eliminates 30 planets orbiting disturbed binary hosts, leaving 88 Tier 1 prime targets that offer the cleanest, most practical opportunities for atmospheric characterization, and that feed into the team’s Earth-similarity filtering.

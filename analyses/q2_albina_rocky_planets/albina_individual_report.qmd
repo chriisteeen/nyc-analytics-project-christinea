@@ -1,0 +1,380 @@
+---
+title: "Earth - Like Exoplanet Composition and Interior Similarity"
+author: "Albina Osipina"
+format:
+  html:
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+## Specific Question
+
+Which confirmed exoplanets meet the selected Earth - like radius and mass boundaries, what proportion appear rocky rather than volatile-rich, and which rocky - like candidates have interiors most similar to Earth?
+
+## Analytical Approach
+
+The analysis used planetary radius, mass, density, and mass provenance from the NASA Exoplanet Archive.
+
+**Selection conditions:**
+
+- Radius: \(0.5 < R \leq 1.5\) Earth radii
+- Mass: \(0.1 < M \leq 3\) Earth masses
+- Both conditions must be satisfied.
+
+These project-defined boundaries create a broad screening group around Earth’s radius and mass. They are analytical selection criteria rather than a universal scientific definition of an Earth-like planet.
+
+
+Planets with masses derived from an M - R relationship were excluded to avoid circular classification. The remaining planets were classified by comparing their observed masses with the rocky and volatile-rich relationships from Otegi et al. (2020). Rocky - like candidates were then ranked using an Interior ESI based on radius and density. This score measures physical similarity to Earth’s interior, not habitability.
+
+## Data Acquisition and Processing
+
+The NASA Planetary Systems Composite Parameters data were downloaded through the NASA Exoplanet Archive API using shared/download_nasa_data.R. The shared pipeline then cleaned and validated the data using shared/prepare_analysis_data.R and calculated the project-wide ESI values using shared/esi/calculate_esi.R. These scripts produce the processed esi_results.csv file used in this analysis.
+
+```{r}
+#| eval: false
+
+# Run from the repository root to rebuild the processed data
+source("shared/download_nasa_data.R")
+source("shared/prepare_analysis_data.R")
+source("shared/esi/calculate_esi.R")
+```
+
+```{r}
+# Import the processed dataset used in this report
+esi_results <- read.csv(
+  "../../data/processed/esi_results.csv",
+  stringsAsFactors = FALSE
+)
+
+required_columns <- c(
+  "pl_name",
+  "pl_rade",
+  "pl_bmasse",
+  "pl_dens",
+  "pl_bmassprov"
+)
+
+stopifnot(
+  all(required_columns %in% names(esi_results))
+)
+```
+
+## Candidate Selection
+
+```{r}
+# Select planets within the Earth-like boundaries
+earth_candidates <- esi_results[
+  !is.na(esi_results$pl_rade) &
+    !is.na(esi_results$pl_bmasse) &
+    esi_results$pl_rade > 0.5 &
+    esi_results$pl_rade <= 1.5 &
+    esi_results$pl_bmasse > 0.1 &
+    esi_results$pl_bmasse <= 3,
+]
+
+candidate_count <- nrow(earth_candidates)
+```
+
+The selection retained 913 of the 6,366 confirmed exoplanets. These planets satisfied both the radius and mass conditions and formed the initial candidate sample.
+
+## Interior Earth Similarity Index
+
+Interior ESI compares each planet’s radius and density with Earth. Earth’s reference values were set to 1 Earth radius and 5.514 g/cm³. The component weights were 0.57 for radius and 1.07 for density, following Schulze - Makuch et al. (2011). Scores closer to 1 indicate greater interior similarity to Earth.
+
+```{r}
+# Calculate the radius component
+earth_candidates$radius_score <- (
+  1 - abs(
+    (earth_candidates$pl_rade - 1) /
+      (earth_candidates$pl_rade + 1)
+  )
+)^0.57
+
+# Calculate the density component
+earth_candidates$density_score <- (
+  1 - abs(
+    (earth_candidates$pl_dens - 5.514) /
+      (earth_candidates$pl_dens + 5.514)
+  )
+)^1.07
+
+# Combine both components
+earth_candidates$interior_esi <- sqrt(
+  earth_candidates$radius_score *
+    earth_candidates$density_score
+)
+
+interior_count <- sum(
+  !is.na(earth_candidates$interior_esi)
+)
+```
+
+Interior ESI was calculated only when both radius and density were available. The score measures similarity in selected physical characteristics and should not be interpreted as evidence of habitability.
+
+## Mass Provenance Filter
+
+The source of each reported mass was reviewed before composition classification. Planets whose masses were derived from an M - R relationship were excluded because applying another mass-radius relationship to those values would create circular reasoning.
+
+```{r}
+# Review how planet masses were obtained
+mass_provenance <- table(
+  earth_candidates$pl_bmassprov,
+  useNA = "ifany"
+)
+
+# Count masses derived from a mass - radius relationship
+mr_count <- sum(
+  earth_candidates$pl_bmassprov == "M-R relationship",
+  na.rm = TRUE
+)
+
+empirical_candidates <- earth_candidates[
+  !is.na(earth_candidates$pl_bmassprov) &
+    earth_candidates$pl_bmassprov != "M-R relationship",
+]
+
+empirical_count <- nrow(empirical_candidates)
+```
+
+Of the 913 initial candidates, 767 (84.0%) had masses derived from an M–R relationship and were excluded. The remaining 146 planets formed the non M–R derived analysis sample used for composition classification.
+
+## Composition Classification
+
+For each planet, expected mass was calculated from the rocky and volatile - rich mass - radius relationships reported by Otegi et al. (2020):
+
+- Rocky: \(M = 0.90R^{3.45}\)
+- Volatile-rich: \(M = 1.74R^{1.58}\)
+
+The observed mass was compared with both predictions using absolute log - ratio differences. This measures proportional rather than absolute error. Each planet was assigned to the relationship with the smaller difference.
+
+```{r}
+# Expected mass from the rocky relationship
+empirical_candidates$rocky_expected_mass <-
+  0.90 * empirical_candidates$pl_rade^3.45
+
+# Expected mass from the volatile - rich relationship
+empirical_candidates$volatile_expected_mass <-
+  1.74 * empirical_candidates$pl_rade^1.58
+
+# Calculate proportional differences from both relationships
+empirical_candidates$rocky_difference <- abs(
+  log(
+    empirical_candidates$pl_bmasse /
+      empirical_candidates$rocky_expected_mass
+  )
+)
+
+empirical_candidates$volatile_difference <- abs(
+  log(
+    empirical_candidates$pl_bmasse /
+      empirical_candidates$volatile_expected_mass
+  )
+)
+
+# Assign each planet to the closer relationship
+empirical_candidates$composition <- ifelse(
+  empirical_candidates$rocky_difference <=
+    empirical_candidates$volatile_difference,
+  "Rocky-like",
+  "Volatile-rich-like"
+)
+
+composition_counts <- table(
+  empirical_candidates$composition
+)
+```
+Of the 146 non M - R derived candidates, 99 (67.8%) were classified as rocky - like and 47 (32.2%) as volatile - rich - like. Therefore, satisfying the selected radius and mass boundaries did not guarantee a rocky composition.
+
+```{r}
+#| label: fig - composition
+#| fig-cap: "Composition classification of the 146 non-M-R-derived candidates."
+#| fig-width: 7
+#| fig-height: 5
+
+library(ggplot2)
+
+# Prepare the classification summary
+composition_summary <- data.frame(
+  composition = names(composition_counts),
+  count = as.numeric(composition_counts)
+)
+
+composition_summary$percent <- round(
+  composition_summary$count /
+    sum(composition_summary$count) * 100,
+  1
+)
+
+# Plot the composition results
+composition_plot <- ggplot(
+  composition_summary,
+  aes(
+    x = composition,
+    y = percent,
+    fill = composition
+  )
+) +
+  geom_col(width = 0.6) +
+  geom_text(
+    aes(
+      label = paste0(
+        count,
+        " planets\n",
+        percent,
+        "%"
+      )
+    ),
+    vjust = -0.4,
+    size = 4
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Rocky-like" = "steelblue",
+      "Volatile-rich-like" = "mediumpurple4"
+    )
+  ) +
+  labs(
+    title = "Estimated Composition of Earth-Like Candidates",
+    x = NULL,
+    y = "Percentage of candidates"
+  ) +
+  ylim(0, 80) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+
+composition_plot
+```
+
+## Ranking Rocky - Like Candidates
+
+The 99 rocky - like planets were ranked from highest to lowest Interior ESI. The ranking identifies planets with radius and density most similar to Earth within the analysis sample.
+
+```{r}
+# Keep and rank rocky - like candidates
+rocky_ranked <- empirical_candidates[
+  empirical_candidates$composition == "Rocky-like" &
+    !is.na(empirical_candidates$interior_esi),
+]
+
+rocky_ranked <- rocky_ranked[
+  order(
+    rocky_ranked$interior_esi,
+    decreasing = TRUE
+  ),
+  c(
+    "pl_name",
+    "pl_rade",
+    "pl_bmasse",
+    "pl_dens",
+    "pl_bmassprov",
+    "interior_esi",
+    "composition"
+  )
+]
+
+# Prepare the five highest - ranked candidates for display
+top_5_table <- head(rocky_ranked, 5)
+
+top_5_table$interior_esi <- round(
+  top_5_table$interior_esi,
+  3
+)
+
+top_5_table <- top_5_table[
+  c(
+    "pl_name",
+    "pl_rade",
+    "pl_bmasse",
+    "pl_dens",
+    "interior_esi"
+  )
+]
+
+names(top_5_table) <- c(
+  "Planet",
+  "Radius",
+  "Mass",
+  "Density",
+  "Interior ESI"
+)
+
+knitr::kable(
+  top_5_table,
+  caption = "Five highest-ranked rocky-like candidates",
+  digits = 3,
+  row.names = FALSE
+)
+```
+
+Proxima Centauri b had the highest Interior ESI at 0.995. YZ Ceti d, AU Microscopii d, Teegarden’s Star c, and Teegarden’s Star b followed closely. Because the scores are very similar, the ranking should be interpreted as an approximate prioritization rather than a definitive ordering.
+
+```{r}
+#| label: fig - top - rocky
+#| fig-cap: "Ten rocky-like candidates with the highest Interior ESI."
+#| fig-width: 8
+#| fig-height: 5
+
+top_10_rocky <- head(rocky_ranked, 10)
+
+top_10_rocky$pl_name <- factor(
+  top_10_rocky$pl_name,
+  levels = rev(top_10_rocky$pl_name)
+)
+
+ggplot(
+  top_10_rocky,
+  aes(x = interior_esi, y = pl_name)
+) +
+  geom_point(color = "steelblue", size = 4) +
+  geom_text(
+    aes(label = sprintf("%.3f", interior_esi)),
+    nudge_x = 0.0005,
+    hjust = 0,
+    size = 3.5
+  ) +
+  scale_x_continuous(
+    limits = c(0.987, 1.001),
+    breaks = seq(0.988, 1.000, 0.002)
+  ) +
+  labs(
+    title = "Highest Interior ESI Rocky-Like Candidates",
+    subtitle = "Top 10 of 99 planets classified as rocky-like",
+    x = "Interior Earth Similarity Index",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+The leading candidates have very similar Interior ESI scores. Proxima Centauri b ranks first, but the small differences among the top planets indicate that the ranking should be interpreted as approximate rather than definitive.
+
+## Data Quality and Limitations
+
+- **Mass provenance:** We excluded 767 planets whose masses were derived from mass - radius relationships to avoid circular classification. This reduced the analysis sample to 146 non M - R derived planets.
+
+- **Measurement uncertainty:** Planetary mass, radius, and density contain uncertainty that was not incorporated into the classifications. Planets near the boundary could change categories.
+
+- **Minimum-mass estimates:** Some reported values are minimum-mass estimates rather than true planetary masses, which may affect their classification.
+
+- **Model limitations:** The Otegi relationships are empirical approximations and do not directly confirm a planet’s composition.
+
+- **ESI interpretation:** Interior ESI measures similarity in radius and density only. It does not account for atmosphere, temperature, liquid water, stellar activity, or overall habitability.
+
+## Conclusion
+
+Of the 6,366 confirmed exoplanets, 913 met the selected Earth - like radius and mass conditions. After excluding masses derived from mass - radius relationships, 146 planets remained for composition analysis. Of these, 99 were classified as rocky - like and 47 as volatile - rich - like.
+
+Proxima Centauri b had the highest Interior ESI. However, the results show that Earth - like radius and mass alone do not guarantee a rocky composition, and a high Interior ESI should not be interpreted as evidence of habitability.
+
+## References
+
+NASA Exoplanet Archive. (2026). *Planetary Systems Composite Parameters*. California Institute of Technology. https://exoplanetarchive.ipac.caltech.edu/
+
+Otegi, J. F., Bouchy, F., & Helled, R. (2020). Revisited mass-radius relations for exoplanets below 120 Earth masses. *Astronomy & Astrophysics, 634*, A43. https://doi.org/10.1051/0004-6361/201936482
+
+Schulze-Makuch, D., et al. (2011). A two-tiered approach to assessing the habitability of exoplanets. *Astrobiology, 11*(10), 1041–1052. https://doi.org/10.1089/ast.2010.0592

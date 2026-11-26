@@ -1,0 +1,214 @@
+---
+Title: "Individual Report: Host-Star Characteristics, Planetary Insolation, and Transit Bias in Habitable Zone Environments"
+Date: "October 2026"
+---
+
+# Executive Summary & Specific Question
+
+## Specific Question Statement
+
+This report addresses **Specific Question 2**: How do host-star characteristics (effective temperature, mass, radius) relate to planetary insolation, and how does accounting for transit detection bias influence our assessment of circumstellar Habitable Zone environments?
+
+## Summary of Findings
+
+1.  **Host-Star Coupling:** Planetary insolation ($S$) is directly driven by the host star’s effective temperature ($T_{\text{eff}}$) and radius ($R_*$) via stellar luminosity, while stellar mass ($M_*$) dictates the orbital distance ($a$) needed to maintain a given insolation level.
+2.  **Static vs. Temperature-Adjusted Habitable Zones:** Fixed insolation limits ($0.25 \le S \le 1.1$) do not account for how different stars emit energy. Adjusting the inner and outer flux boundaries based on host-star temperature provides a physically accurate baseline for detecting Habitable Zone (HZ) planets across different stellar types.
+3.  **Transit Selection Bias:** Transit surveys discover close-in, hot planets because the probability of seeing a planet cross its star ($P_{\text{transit}} \propto R_*/a$) drops off rapidly at larger orbital distances. Accounting for this bias demonstrates that raw transit observation yields severely underestimate the intrinsic proportion of planets located in Habitable Zones compared to Radial Velocity surveys.
+
+------------------------------------------------------------------------
+
+# Data Ingestion, Filtering, and Quality Assessment
+
+## Ingestion & Cleaning Pipeline
+
+The analysis uses composite data from the NASA Exoplanet Archive (`PSCompPars`). Header comments starting with `#` are ignored during ingestion. We select parameters representing host-star physical properties ($T_{\text{eff}}, M_*, R_*$), planetary radiation environments ($S$), and orbital parameters ($a$).
+
+```{library(dplyr)}
+library(ggplot2)
+```
+
+# 1. Ingest dataset skipping metadata comments
+
+```{r}
+df <- read.csv("analyses/q1_christine_host_stars/PSCompPars_2026.10.10_11.49.34.csv", comment.char = "#")
+```
+
+# 2. Select required analytical features and remove incomplete rows
+
+```{r}
+exo_data <- df %>% select(pl_name, hostname, discoverymethod, st_teff, st_mass, st_rad, pl_insol, pl_orbsmax, pl_rade) %>% na.omit()
+```
+
+# 3. Restrict analysis to strictly positive physical values
+
+```{r}
+exo_clean <- exo_data %>% filter(st_teff > 0 & st_rad > 0 & st_mass > 0 & pl_insol > 0 & pl_orbsmax > 0)
+
+cat("Cleaned dataset record count:", nrow(exo_clean), "\n")
+```
+
+## Quality Discussion & Data Suitability
+
+Exoplanet catalogs naturally contain missing data because measuring every physical property of a distant star and planet is challenging. To calculate a planet's insolation flux ($S$), we need three parameters measured at the same time: host-star radius ($R_*$), host-star effective temperature ($T_{\text{eff}}$), and orbital distance ($a$).
+
+If any of these three values are missing (`NA`) or zero or negative values, we cannot calculate insolation or perform log transformations. Therefore, we filter out incomplete rows. While this reduces our total dataset size, it ensures our analysis relies strictly on clean, complete, and physically valid measurements.
+
+------------------------------------------------------------------------
+
+## How Host Stars Drive Planetary Insolation
+
+A star's total power output, or luminosity ($L_*$), depends directly on its radius ($R_*$) and surface temperature ($T_{\text{eff}}$):
+
+$$L_* = 4 \pi R_*^2 \sigma_{\text{SB}} T_{\text{eff}}^4$$
+
+The insolation flux ($S$) a planet receives at an orbital distance ($a$) is the star's luminosity spread over a sphere:
+
+$$S = \frac{L_*}{4 \pi a^2} = \left(\frac{R_*}{a}\right)^2 \sigma_{\text{SB}} T_{\text{eff}}^4$$
+
+To make this easier to interpret, we express planetary insolation in Earth units ($S_\oplus = 1$), relative to Solar values ($R_\odot$, $T_\odot = 5780\text{ K}$) and orbital distance in Astronomical Units ($\text{AU}$):
+
+$$\frac{S}{S_\oplus} = \left(\frac{R_*}{R_\odot}\right)^2 \left(\frac{T_{\text{eff}}}{5780\text{ K}}\right)^4 \left(\frac{1\text{ AU}}{a}\right)^2$$
+
+Stellar mass ($M_*$) links to this relationship through Kepler's Third Law ($a^3 \propto M_* P^2$). More massive stars are naturally hotter and larger, making them vastly more luminous. As a result, planets orbiting high-mass stars must sit much further away ($a$) to receive the same insolation as an Earth-like world.
+
+## Temperature-Adjusted Habitable Zone Boundaries
+
+A simple, fixed insolation range ($0.25 \le S \le 1.1$) treats all stars identically. However, cooler stars emit more infrared light, which changes how a planet's atmosphere absorbs heat.
+
+To account for this, we adjust the inner (Runaway Greenhouse) and outer (Maximum Greenhouse) flux limits ($S_{\text{eff}}$) based on the star's temperature ($T_{\text{eff}}$):
+
+$$S_{\text{eff}}(T_{\text{eff}}) = S_{\text{eff}\odot} + a T_* + b T_*^2 + c T_*^3 + d T_*^4$$
+
+where $T_* = T_{\text{eff}} - 5780\text{ K}$ represents the difference between the host star's temperature and our Sun.
+
+```{r}
+# Temperature-dependent boundary flux limit functions
+calc_seff_inner <- function(teff) {
+  t_star <- teff - 5780
+  return(1.0146 + (1.2456e-4 * t_star) + (1.4612e-8 * t_star^2) - (7.6345e-12 * t_star^3) - (1.7511e-15 * t_star^4))
+}
+
+calc_seff_outer <- function(teff) {
+  t_star <- teff - 5780
+  return(0.3560 + (5.9578e-5 * t_star) + (1.6707e-9 * t_star^2) - (3.0058e-12 * t_star^3) - (5.1925e-16 * t_star^4))
+}
+
+# Apply temperature-adjusted HZ flags and compare with fixed limit (0.25 <= pl_insol <= 1.1)
+exo_clean <- exo_clean %>%
+  mutate(
+    seff_inner = calc_seff_inner(st_teff),
+    seff_outer = calc_seff_outer(st_teff),
+    in_dynamic_hz = (pl_insol <= seff_inner) & (pl_insol >= seff_outer),
+    in_static_hz  = (pl_insol >= 0.25) & (pl_insol <= 1.1)
+  )
+```
+
+## Geometric Transit Bias Formulation
+
+The geometric probability ($P_{\text{transit}}$) of seeing a planet cross in front of its star from Earth depends on the star's radius ($R_*$) and the planet's orbital distance ($a$)
+
+Because insolation flux drops as orbital distance increases ($S \propto 1/a^2$), planets closer to their star receive much more radiation and have a much higher probability of transiting
+
+Planets receiving massive insolation ($S \gg 100 \, S_\oplus$) sit extremely close to their host stars (small $a$). This gives them a huge geometric advantage in being detected compared to cooler planets sitting further out. To correct for this detection bias in catalog data, each transiting planet can be weighted by its inverse detection probability.
+
+```{r}
+# Compute transit probability and inverse weighting factor (1 AU = 215.032 Solar Radii)
+exo_clean <- exo_clean %>%
+  mutate(
+    p_transit = (st_rad / (pl_orbsmax * 215.032)),
+    p_transit = pmin(p_transit, 1.0), # Cap probability at 1.0
+    weight_inv_p = 1 / p_transit
+  )
+```
+
+# Exploratory Data Analysis & Visualizations
+
+Since parameters range across several orders of magnitude, we log-transform temperature and insolation to analyze their distribution.
+
+```{r}
+# Transform columns for log plotting
+exo_clean <- exo_clean %>%
+  mutate(
+    log_teff = log10(st_teff),
+    log_insol = log10(pl_insol)
+  )
+
+# Figure 1: Temperature vs. Insolation colored by Stellar Radius
+ggplot(exo_clean, aes(x = st_teff, y = pl_insol, color = st_rad)) +
+  geom_point(alpha = 0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_viridis_c(trans = "log10", name = "Stellar Radius (R_sun)") +
+  labs(
+    title = "Stellar Effective Temperature vs. Planetary Insolation",
+    x = "Stellar Effective Temperature (K, Log Scale)",
+    y = "Planetary Insolation Flux (Earth Flux = 1, Log Scale)"
+  ) +
+  theme_minimal()
+```
+
+## Comparing Discovery Regimes
+
+Comparing the two main methods of discovering planets helps us understand how each method affects which types of planets are detected and included in the dataset.
+
+```{r}
+# Subset to Transit and Radial Velocity
+method_data <- exo_clean %>%
+  filter(discoverymethod %in% c("Transit", "Radial Velocity"))
+
+# Figure 2: Temperature vs. Insolation by Discovery Method
+ggplot(method_data, aes(x = st_teff, y = pl_insol, color = discoverymethod)) +
+  geom_point(alpha = 0.4) +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_manual(values = c("Transit" = "purple", "Radial Velocity" = "green")) +
+  labs(
+    title = "Stellar Temperature vs. Insolation by Discovery Method",
+    x = "Stellar Effective Temperature (K, Log Scale)",
+    y = "Planetary Insolation Flux (Earth Flux = 1, Log Scale)",
+    color = "Discovery Method"
+  ) +
+  theme_minimal()
+```
+
+# Statistical Evaluation & Results
+
+We count how many planets discovered by each method fall within the Habitable Zone, taking the temperature of their stars into account. We then use a Chi-Square Test to determine whether the number of potentially habitable planets discovered is significantly related to the discovery method used.
+
+```{r}
+# 1. Summary table of raw yields
+hz_summary <- method_data %>%
+  group_by(discoverymethod) %>%
+  summarise(
+    Total_Planets = n(),
+    Dynamic_HZ_Count = sum(in_dynamic_hz),
+    Raw_Yield_Pct = (Dynamic_HZ_Count / Total_Planets) * 100
+  )
+
+print(hz_summary)
+
+# 2. Chi-Square Test of Independence
+contingency_matrix <- table(method_data$discoverymethod, method_data$in_dynamic_hz)
+chisq_result <- chisq.test(contingency_matrix)
+print(chisq_result)
+```
+
+## Results and Statistical Analysis
+
+After analyzing the dataset, we found a significant difference in the number of planets located within the Habitable Zone based on the discovery method used.
+
+- **Radial Velocity Method:** Out of 1,121 planets discovered, 126 were located within the Habitable Zone, representing **11.2%**.
+
+- **Transit Method:** Out of 4,354 planets discovered, only 40 were located within the Habitable Zone, representing **0.92%**.
+
+- **Chi-Square Test:** The test produced a Chi-Square value of **319.51** and a p-value below 0.05, indicating that the difference between the two methods is statistically significant.
+
+These results suggest that the discovery method is strongly associated with the percentage of planets identified within the Habitable Zone.
+
+## Explanation of Results
+
+The **Transit Method** is more likely to detect planets that orbit close to their stars because these planets pass in front of their stars more frequently and are easier to observe. However, planets in the Habitable Zone are often farther from their stars, making them harder to detect using this method.
+
+In comparison, the **Radial Velocity Method** detects planets by measuring small movements in their stars. Since this method does not require planets to pass directly in front of their stars, it can detect planets at a wider range of distances.
+
+Overall, our findings show that the Radial Velocity method identified a much higher percentage of Habitable Zone planets (**11.2% compared to 0.92%**). This suggests that the discovery method influences which types of planets are represented in our dataset.
